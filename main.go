@@ -55,25 +55,41 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func balancesHandler(w http.ResponseWriter, r *http.Request) {
+func authorization(r *http.Request) string {
+	return r.Header.Get("Authorization")
+}
+
+func ynabRequest(resp any, auth string, path string, args ...any) (*http.Response, error) {
 	// create a request to the ynab API
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://api.ynab.com/v1/budgets/%s", BudgetID), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://api.ynab.com/v1/"+path, args...), nil)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
-	// extract the bearer token from the request header
-	token := r.Header.Get("Authorization")
-	req.Header.Set("Authorization", token)
+	req.Header.Set("Authorization", auth)
 
 	// make the request
-	resp, err := http.DefaultClient.Do(req)
+	r, err := http.DefaultClient.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
+	defer r.Body.Close()
+
+	err = json.NewDecoder(r.Body).Decode(resp)
+	return r, err
+}
+
+// reportError reports an errer, if non-nil, to the client
+// err is a pointer to the error to enable direct use with defer.
+func reportError(w http.ResponseWriter, err *error) {
+	if *err != nil {
+		http.Error(w, (*err).Error(), http.StatusInternalServerError)
+	}
+}
+
+func balancesHandler(w http.ResponseWriter, r *http.Request) {
+	var err error
+	defer reportError(w, &err)
 
 	type YNABBudgetResp struct {
 		Data struct {
@@ -87,9 +103,8 @@ func balancesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ynabBudgetResp := YNABBudgetResp{}
-	err = json.NewDecoder(resp.Body).Decode(&ynabBudgetResp)
+	resp, err := ynabRequest(&ynabBudgetResp, authorization(r), "budgets/%s", BudgetID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -113,10 +128,6 @@ func balancesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	err = json.NewEncoder(w).Encode(balances)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 }
 
 func main() {
