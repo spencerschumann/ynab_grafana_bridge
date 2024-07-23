@@ -76,6 +76,16 @@ func ynabRequest(resp any, auth string, path string, args ...any) (*http.Respons
 	}
 	defer r.Body.Close()
 
+	// For debugging - log the response body
+	if false {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Printf("*************\nReq: %s\nHeaders: %+v\nBody: %s\n", req.RequestURI, r.Header, string(data))
+		return r, err
+	}
+
 	err = json.NewDecoder(r.Body).Decode(resp)
 	return r, err
 }
@@ -99,25 +109,30 @@ type YNABBudgetResp struct {
 	} `json:"data"`
 }
 
-type YNABAccountResp struct {
+type YNABAccount struct {
+	Name             string  `json:"name"`
+	ID               string  `json:"id"`
+	Balance          float64 `json:"balance"`
+	ClearedBalance   float64 `json:"cleared_balance"`
+	UnclearedBalance float64 `json:"uncleared_balance"`
+}
+
+type YNABAccountsResp struct {
 	Data struct {
-		Account struct {
-			Name             string  `json:"name"`
-			Balance          float64 `json:"balance"`
-			ClearedBalance   float64 `json:"cleared_balance"`
-			UnclearedBalance float64 `json:"uncleared_balance"`
-		} `json:"account"`
+		Accounts []YNABAccount `json:"accounts"`
 	} `json:"data"`
 }
 
 type YNABTransactionsResp struct {
 	Data struct {
 		Transactions []struct {
-			Date     string  `json:"date"`
-			Account  string  `json:"account_name"`
-			Amount   float64 `json:"amount"`
-			Payee    string  `json:"payee_name"`
-			Category string  `json:"category_name"`
+			Date      string  `json:"date"`
+			Account   string  `json:"account_name"`
+			AccountID string  `json:"account_id"`
+			Amount    float64 `json:"amount"`
+			Payee     string  `json:"payee_name"`
+			Category  string  `json:"category_name"`
+			Memo      string  `json:"memo"`
 			// TODO: there are fields for transfers that may be relevant
 		} `json:"transactions"`
 	} `json:"data"`
@@ -171,14 +186,31 @@ func balancesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func transactionsHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("transactionsHandler")
+
 	var err error
 	defer reportError(w, &err)
 
+	accountID := r.PathValue("account")
+
 	// could get this via a cached all accounts call, but this is simpler for now
-	account := YNABAccountResp{}
-	_, err = ynabRequest(&account, authorization(r),
-		"budgets/%s/accounts/%s", BudgetID, Chase3577AccountID)
+	accounts := YNABAccountsResp{}
+	_, err = ynabRequest(&accounts, authorization(r),
+		"budgets/%s/accounts", BudgetID)
 	if err != nil {
+		return
+	}
+
+	// Find the account
+	account := YNABAccount{}
+	for _, a := range accounts.Data.Accounts {
+		if a.ID == accountID {
+			account = a
+			break
+		}
+	}
+	if account.ID == "" {
+		err = fmt.Errorf("Account not found: %s", accountID)
 		return
 	}
 
@@ -187,7 +219,7 @@ func transactionsHandler(w http.ResponseWriter, r *http.Request) {
 	// TODO: may want to cache these, and fetch transactions for all accounts
 	// to reduce the number of API calls
 	_, err = ynabRequest(&ynabTransactions, authorization(r),
-		"budgets/%s/accounts/%s/transactions", BudgetID, Chase3577AccountID)
+		"budgets/%s/transactions", BudgetID)
 	if err != nil {
 		return
 	}
@@ -209,40 +241,46 @@ func transactionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	var resp []Transaction
 
+	// helper function to add transactions
+	addTransaction := func(date string, balance float64) {
+		if date == "" {
+			return
+		}
+		resp = append(resp, Transaction{
+			Date:    date + "T00:00:00Z",
+			Balance: balance / 1000.0,
+		})
+	}
+
 	// Sort transactions new to old
 	sort.SliceStable(transactions, func(i, j int) bool {
 		return transactions[i].Date > transactions[j].Date
 	})
 
-	fmt.Printf("Balance: %f, transactions: %d, scheduled transactions: %d\n", account.Data.Account.Balance,
-		len(transactions), len(scheduledTransactions.Data.ScheduledTransactions))
+	fmt.Printf("Account: %s, Balance: %f, transactions: %d, scheduled transactions: %d\n",
+		accountID, account.Balance, len(transactions), len(scheduledTransactions.Data.ScheduledTransactions))
 
 	// Calculate the running balance
-	balance := account.Data.Account.Balance
+	balance := account.Balance
 	date := ""
 	dailySum := 0.0
 	for _, transaction := range transactions {
+		// Filter for this account
+		if transaction.AccountID != accountID {
+			continue
+		}
+
 		// Sum all the transactions per date, then add them to the balance
 		if date != transaction.Date {
 			// Traveling backwards, so subtract
 			balance -= dailySum
 			dailySum = 0.0
 			date = transaction.Date
-			if date != "" {
-				resp = append(resp, Transaction{
-					Date:    date + "T00:00:00Z",
-					Balance: balance / 1000,
-				})
-			}
+			addTransaction(date, balance)
 		}
 		dailySum += transaction.Amount
 	}
-	if date != "" {
-		resp = append(resp, Transaction{
-			Date:    date + "T00:00:00Z",
-			Balance: balance / 1000,
-		})
-	}
+	addTransaction(date, balance)
 
 	err = json.NewEncoder(w).Encode(resp)
 }
@@ -315,10 +353,11 @@ func transactionsByPayeeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("/balances", balancesHandler)
-	http.HandleFunc("/transactions", transactionsHandler)
-	http.HandleFunc("/transactions-by-payee", transactionsByPayeeHandler)
-	http.HandleFunc("/query", queryHandler)
+	http.HandleFunc("GET /balances", balancesHandler)
+	http.HandleFunc("GET /transactions/{account}", transactionsHandler)
+	http.HandleFunc("GET /transactions-by-payee", transactionsByPayeeHandler)
+	http.HandleFunc("GET /query", queryHandler)
+
 	fmt.Println("Listening on :8080")
 	http.ListenAndServe(":8080", nil)
 }
